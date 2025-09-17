@@ -491,6 +491,7 @@ if __name__ == "__main__":
         print("   ✅ Cloud masking (clouds, shadows, cirrus)")
         print("   ✅ Land type masking (cropland areas only)")  
         print("   ✅ Time frame masking (specified date range)")
+        print(" First Commit Worked") #Simple testing for github
         
     except Exception as e:
         print(f"❌ Error in processing: {e}")
