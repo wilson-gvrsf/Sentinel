@@ -236,7 +236,6 @@ class NDTIProcessor:
         #                3) You can see detail about the Sentinel-2 data (like band resolution and wavelength) from here: 
         #                   https://custom-scripts.sentinel-hub.com/custom-scripts/sentinel-2/bands/
         # Reproject cropland mask to match Sentinel-2 resolution for efficiency
-        #CHIMA COMMENTS:
         cropland_reprojected = self.cropland_mask.reproject(
             crs=image.select('B4').projection(), 
             scale=sentinel_resolution
@@ -258,7 +257,6 @@ class NDTIProcessor:
             ee.Image: Image with valid_pixel_count property added
         """
         # Use B4 (red band) mask as representative of overall image mask
-        #CHIMA COMMENTS:
         mask = image.select('B4').mask().unmask(0)
 
         # Count valid pixels in the AOI
@@ -269,7 +267,8 @@ class NDTIProcessor:
             maxPixels=1e9,
             bestEffort=True
         )
-        
+        #CHIMA COMMMENT: Makes sense to work with 20m resolution here since that's the res of B11 and B12 bands
+
         count = count_dict.values().get(0)
         return image.set('valid_pixel_count', count)
 
@@ -315,7 +314,9 @@ class NDTIProcessor:
                       .filterDate(self.date_range[0], self.date_range[1])
                       .filterBounds(self.aoi_geometry)
                       .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 30)))  # Pre-filter high cloud images
-        
+        #CHIMA COMMMENT: Think the 'CLOUDY_PIXEL_PERCENTAGE' filter is uncessary since you already filter when an image is covered by 80% clouds
+        #               if you want more strict cloud filtering then just change 'clear_threshold' to a lower value rather than adding more code
+
         initial_count = filtered_s2.size().getInfo()
         if self.verbose:
             print(f"   📊 Images after initial filtering: {initial_count}")
@@ -356,7 +357,7 @@ class NDTIProcessor:
             ee.Filter.gt('valid_pixel_count', min_valid_pixels)
         )
         
-        #CHIMA COMMMENT: Might make more sense to have 'min_valid_pixels' be realtive to how many total pixels there could be
+         #CHIMA COMMMENT: Might make more sense to have 'min_valid_pixels' be realtive to how many total pixels there could be
           #                That way in case there's a lot of missing pixels do to the crop region being small, you aren't removing 
           #                useful data. You'd have to count the total pixels of the first image after just applying the landtype
           #                and aoi mask for this
@@ -475,7 +476,7 @@ class NDTIProcessor:
                         scale=10,
                         maxPixels=1e9
                     ).getInfo()
-                    
+
                     results['seasonal'][season_name] = {
                         'image_count': seasonal_count,
                         'ndti_mean': seasonal_stats.get('NDTI_mean'),
