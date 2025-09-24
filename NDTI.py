@@ -263,11 +263,12 @@ class NDTIProcessor:
         count_dict = mask.reduceRegion(
             reducer=ee.Reducer.sum(),
             geometry=self.aoi_geometry,
-            scale=10,  # 10m resolution
+            scale=20,  # 20m resolution
             maxPixels=1e9,
             bestEffort=True
         )
         #CHIMA COMMMENT: Makes sense to work with 20m resolution here since that's the res of B11 and B12 bands
+        #DONE
 
         count = count_dict.values().get(0)
         return image.set('valid_pixel_count', count)
@@ -293,18 +294,33 @@ class NDTIProcessor:
         """
 
         if self.verbose:
-            print("\n🛰️  PROCESSING SENTINEL-2 DATA FOR NDTI ANALYSIS")
-            print("="*60)
-
-        # 1. Load Sentinel-2 Surface Reflectance and Cloud Score+ collections
-        if self.verbose:
             print("1️⃣  Loading Sentinel-2 Surface Reflectance and Cloud Score+ data...")
 
         s2_collection = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
         cs_plus_collection = ee.ImageCollection('GOOGLE/CLOUD_SCORE_PLUS/V1/S2_HARMONIZED')
 
+        # Show total available images before any filtering to assess data availability
+        if self.verbose:
+            total_s2_images = (s2_collection
+                              .filterDate(self.date_range[0], self.date_range[1])
+                              .filterBounds(self.aoi_geometry)
+                              .size()
+                              .getInfo())
+            print(f"   📊 Total Sentinel-2 images available (before filtering): {total_s2_images}")
+            
+            if total_s2_images == 0:
+                print("   ⚠️  No images found for this date range and location!")
+            elif total_s2_images < 5:
+                print("   ⚠️  Very few images available - consider expanding date range")
+            else:
+                print(f"   ✅ Good image availability for analysis")
+        if self.verbose:
+            print("\n🛰️  PROCESSING SENTINEL-2 DATA FOR NDTI ANALYSIS")
+            print("="*60)
+
         #CHIMA COMMMENT: Not necessary at all, but it'd be nice to see the number of valid images before filtering, just to identify if filtering might
         #              be too agressive
+        #DONE
 
         # 2. Initial filtering by date, area, and cloud cover
         if self.verbose:
@@ -312,10 +328,10 @@ class NDTIProcessor:
 
         filtered_s2 = (s2_collection
                       .filterDate(self.date_range[0], self.date_range[1])
-                      .filterBounds(self.aoi_geometry)
-                      .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 30)))  # Pre-filter high cloud images
+                      .filterBounds(self.aoi_geometry))  # Pre-filter high cloud images
         #CHIMA COMMMENT: Think the 'CLOUDY_PIXEL_PERCENTAGE' filter is uncessary since you already filter when an image is covered by 80% clouds
         #               if you want more strict cloud filtering then just change 'clear_threshold' to a lower value rather than adding more code
+        # DONE
 
         initial_count = filtered_s2.size().getInfo()
         if self.verbose:
@@ -327,10 +343,10 @@ class NDTIProcessor:
 
         # 3. Link with Cloud Score+ and apply advanced masking
         if self.verbose:
-            print("3️⃣  Applying advanced cloud and shadow masking...")
+            print("3️⃣  Applying all masking, including Cloud, Shadow, and Landtype")
             
         #CHIMA COMMMENT: Misprint. You're next step is applying ALL masking (cloud, shadow, and landtype). As well as calculating the NDTI
-        
+        #DONE
         def apply_all_masks(image):
             """Apply cloud masking, cropland masking, and NDTI calculation"""
             # Cloud masking
@@ -353,14 +369,66 @@ class NDTIProcessor:
         if self.verbose:
             print("4️⃣  Filtering images by valid pixel count...")
 
+        # Calculate total possible pixels for relative threshold
+        # Use the first processed image to determine max possible pixels after landtype and AOI masking
+        first_image = processed_collection.first()
+        
+        if first_image is not None:
+            # Create a mask that only applies cropland and AOI masking (no cloud masking)
+            # to determine the maximum possible valid pixels
+            baseline_image = (filtered_s2.first()
+                            .select('B4'))  # Use any band as reference
+            
+            # Apply only cropland mask to get baseline pixel count
+            cropland_baseline = self.apply_cropland_mask(baseline_image)
+            
+            # Count total possible pixels in cropland areas within AOI
+            total_possible_mask = cropland_baseline.select('B4').mask().unmask(0)
+            
+            total_possible_dict = total_possible_mask.reduceRegion(
+                reducer=ee.Reducer.sum(),
+                geometry=self.aoi_geometry,
+                scale=20,  # Match SWIR band resolution
+                maxPixels=1e9,
+                bestEffort=True
+            )
+            
+            total_possible_pixels = total_possible_dict.values().get(0).getInfo()
+            
+            if self.verbose:
+                print(f"   📊 Total possible cropland pixels in AOI: {total_possible_pixels}")
+            
+            # Convert min_valid_pixels to relative threshold if it's between 0 and 1
+            if min_valid_pixels <= 1.0:
+                # Treat as percentage (e.g., 0.1 = 10% of possible pixels)
+                absolute_min_pixels = int(total_possible_pixels * min_valid_pixels)
+                if self.verbose:
+                    print(f"   📏 Using relative threshold: {min_valid_pixels*100:.1f}% = {absolute_min_pixels} pixels")
+            else:
+                # Treat as absolute number
+                absolute_min_pixels = int(min_valid_pixels)
+                relative_percent = (absolute_min_pixels / total_possible_pixels * 100) if total_possible_pixels > 0 else 0
+                if self.verbose:
+                    print(f"   📏 Using absolute threshold: {absolute_min_pixels} pixels ({relative_percent:.1f}% of possible)")
+        else:
+            # Fallback to absolute threshold if we can't calculate total possible pixels
+            absolute_min_pixels = int(min_valid_pixels) if min_valid_pixels > 1 else 100
+            if self.verbose:
+                print(f"   ⚠️  Could not calculate relative threshold, using absolute: {absolute_min_pixels} pixels")
+
+        # Apply the filtering with calculated threshold
         final_collection = processed_collection.filter(
-            ee.Filter.gt('valid_pixel_count', min_valid_pixels)
+            ee.Filter.gt('valid_pixel_count', absolute_min_pixels)
         )
         
-         #CHIMA COMMMENT: Might make more sense to have 'min_valid_pixels' be realtive to how many total pixels there could be
+        final_count = final_collection.size().getInfo()
+        removed_count = initial_count - final_count
+        
+         #CHIMA COMMMENT: Might make more sense to have 'min_valid_pixels' be relative to how many total pixels there could be
           #                That way in case there's a lot of missing pixels do to the crop region being small, you aren't removing 
           #                useful data. You'd have to count the total pixels of the first image after just applying the landtype
           #                and aoi mask for this
+          # DONE
       
         final_count = final_collection.size().getInfo()
         removed_count = initial_count - final_count
