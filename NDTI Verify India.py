@@ -138,35 +138,37 @@ class CroplandProcessor:
             print(f"Error initializing CroplandProcessor for {quadrant_name}: {e}")
             raise
 
-    def Pull_Process_Sentinel_data(self, QA_BAND='cs_cdf', CLEAR_THRESHOLD=0.70):
-        """Process Sentinel-2 data with comprehensive masking"""
+    def Pull_Process_Sentinel_data(self, QA_BAND='cs_cdf', CLEAR_THRESHOLD=0.60):
+        """
+        Process Sentinel-2 data with comprehensive masking
+        Relaxed thresholds to capture more images
+        """
         
         try:
             def mask_clouds_advanced(img):
-                """Enhanced cloud masking"""
+                """
+                More relaxed cloud masking to capture more images
+                Still removes obvious clouds but keeps more data
+                """
                 try:
                     cs = img.select(QA_BAND)
-                    cloud_mask = cs.gte(CLEAR_THRESHOLD)
+                    cloud_mask = cs.gte(CLEAR_THRESHOLD)  # Now 0.60 (relaxed from 0.70)
                     scl = img.select('SCL')
                     
-                    cloud_shadow_mask = scl.neq(3)
-                    cloud_medium_mask = scl.neq(8)
-                    cloud_high_mask = scl.neq(9)
-                    cirrus_mask = scl.neq(10)
-                    snow_mask = scl.neq(11)
-                    water_mask = scl.neq(6)
-                    saturated_mask = scl.neq(1)
-                    dark_mask = scl.neq(2)
+                    # Only mask the most problematic classes
+                    cloud_shadow_mask = scl.neq(3)   # Cloud shadows
+                    cloud_high_mask = scl.neq(9)     # High probability clouds
+                    cirrus_mask = scl.neq(10)        # Cirrus
+                    water_mask = scl.neq(6)          # Water
+                    saturated_mask = scl.neq(1)      # Saturated/defective
                     
+                    # Allow medium clouds (8), snow (11), and dark areas (2) for more data
                     combined_mask = (cloud_mask
                                     .And(cloud_shadow_mask)
-                                    .And(cloud_medium_mask) 
                                     .And(cloud_high_mask)
                                     .And(cirrus_mask)
-                                    .And(snow_mask)
                                     .And(water_mask)
-                                    .And(saturated_mask)
-                                    .And(dark_mask))
+                                    .And(saturated_mask))
                     
                     return img.updateMask(combined_mask)
                 except Exception as e:
@@ -217,7 +219,8 @@ class CroplandProcessor:
                 print(f"    ❌ No images found")
                 return ee.ImageCollection([])
 
-            filtered_s2_date_area = filtered_s2_date_area.filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 60))
+            # More relaxed cloud filtering to get more images
+            filtered_s2_date_area = filtered_s2_date_area.filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 80))
             
             after_cloud_filter = filtered_s2_date_area.size().getInfo()
             if self.Verbose:
@@ -235,8 +238,9 @@ class CroplandProcessor:
             ndti_collection = land_masked_collection.map(calculate_ndti)
             ndti_collection_with_counts = ndti_collection.map(set_pixel_count)
             
+            # Lower threshold for valid pixels to include more images
             final_collection = ndti_collection_with_counts.filter(
-                ee.Filter.gt('valid_pixel_count', 50))
+                ee.Filter.gt('valid_pixel_count', 10))  # Reduced from 50 to 10
             
             final_count = final_collection.size().getInfo()
             if self.Verbose:
@@ -253,18 +257,27 @@ class CroplandProcessor:
             return ee.ImageCollection([])
 
     def calculate_ndti_stats(self, collection):
-        """Calculate NDTI statistics"""
+        """
+        Calculate NDTI statistics with histogram distribution:
+        - Mean of all pixel means across time
+        - Mean of pixel-wise minimums
+        - Mean of pixel-wise maximums
+        - Histogram distribution with defined bins
+        """
         try:
             if collection.size().getInfo() == 0:
                 return None
             
-            ndti_mean = collection.select('NDTI').mean()
+            # Calculate temporal mean (average NDTI over time period)
+            ndti_mean_image = collection.select('NDTI').mean()
             
-            stats = ndti_mean.reduceRegion(
+            # Calculate pixel-wise min and max across time
+            ndti_min_image = collection.select('NDTI').min()
+            ndti_max_image = collection.select('NDTI').max()
+            
+            # Get mean NDTI (average of all pixel means)
+            mean_stats = ndti_mean_image.reduceRegion(
                 reducer=ee.Reducer.mean().combine(
-                    reducer2=ee.Reducer.minMax(),
-                    sharedInputs=True
-                ).combine(
                     reducer2=ee.Reducer.stdDev(),
                     sharedInputs=True
                 ),
@@ -274,13 +287,43 @@ class CroplandProcessor:
                 bestEffort=True
             ).getInfo()
             
+            # Get mean of pixel-wise minimums (not the absolute minimum)
+            min_stats = ndti_min_image.reduceRegion(
+                reducer=ee.Reducer.mean(),
+                geometry=self.AoI_geom,
+                scale=self.SentRes,
+                maxPixels=1e9,
+                bestEffort=True
+            ).getInfo()
+            
+            # Get mean of pixel-wise maximums (not the absolute maximum)
+            max_stats = ndti_max_image.reduceRegion(
+                reducer=ee.Reducer.mean(),
+                geometry=self.AoI_geom,
+                scale=self.SentRes,
+                maxPixels=1e9,
+                bestEffort=True
+            ).getInfo()
+            
+            # Get histogram with fixed bins: -1.0 to 1.0 in 0.2 intervals
+            # Bins: [-1.0, -0.8), [-0.8, -0.6), [-0.6, -0.4), [-0.4, -0.2), 
+            #       [-0.2, 0.0), [0.0, 0.2), [0.2, 0.4), [0.4, 0.6), [0.6, 0.8), [0.8, 1.0]
+            histogram = ndti_mean_image.reduceRegion(
+                reducer=ee.Reducer.fixedHistogram(-1.0, 1.0, 10),  # 10 bins of 0.2 width
+                geometry=self.AoI_geom,
+                scale=self.SentRes,
+                maxPixels=1e9,
+                bestEffort=True
+            ).getInfo()
+            
             return {
-                'mean_ndti': stats.get('NDTI_mean', 0),
-                'min_ndti': stats.get('NDTI_min', 0),
-                'max_ndti': stats.get('NDTI_max', 0),
-                'std_ndti': stats.get('NDTI_stdDev', 0),
+                'mean_ndti': mean_stats.get('NDTI_mean', 0),
+                'min_ndti': min_stats.get('NDTI', 0),  # Mean of pixel minimums
+                'max_ndti': max_stats.get('NDTI', 0),  # Mean of pixel maximums
+                'std_ndti': mean_stats.get('NDTI_stdDev', 0),
                 'image_count': collection.size().getInfo(),
-                'quadrant': self.quadrant_name
+                'quadrant': self.quadrant_name,
+                'histogram': histogram.get('NDTI', [])
             }
             
         except Exception as e:
@@ -304,14 +347,15 @@ class CroplandProcessor:
 
 def split_bihar_into_quadrants():
     """
-    Split Bihar region into 4 quadrants
-    Based on the map: approximately 24°N to 27°N, 84°E to 88°E
+    Split Bihar region into 4 quadrants with extended coverage
+    Based on the map: approximately 24°N to 27.5°N, 83.5°E to 88.5°E
+    Extended boundaries to ensure full coverage
     """
-    # Bihar approximate bounds
+    # Bihar approximate bounds - extended for better coverage
     bihar_north = 27.5
     bihar_south = 24.0
-    bihar_west = 84.0
-    bihar_east = 88.0
+    bihar_west = 83.5   # Extended west
+    bihar_east = 88.5   # Extended east
     
     # Calculate midpoints
     mid_lat = (bihar_north + bihar_south) / 2
@@ -364,49 +408,72 @@ def calculate_overall_mean(quadrant_results):
     
     return mean_stats
 
+def parse_histogram(histogram_data):
+    """Parse GEE histogram format into bins and counts"""
+    if not histogram_data or len(histogram_data) == 0:
+        return None, None
+    
+    bins = []
+    counts = []
+    
+    for entry in histogram_data:
+        if len(entry) >= 2:
+            bins.append(entry[0])  # Bin start value
+            counts.append(entry[1])  # Count in that bin
+    
+    return bins, counts
+
 def visualize_bihar_results(quadrant_results, overall_mean, start_date, end_date):
-    """Create visualization of Bihar NDTI analysis"""
+    """Create visualization focusing on NDTI distribution histograms"""
     try:
-        fig, axes = plt.subplots(2, 3, figsize=(18, 12))
-        fig.suptitle(f'Bihar Region NDTI Analysis (4 Quadrants)\n{start_date} to {end_date}', 
-                     fontsize=16, fontweight='bold')
+        fig = plt.figure(figsize=(20, 12))
+        gs = fig.add_gridspec(3, 4, hspace=0.35, wspace=0.3)
         
-        # Plot individual quadrants
+        fig.suptitle(f'Bihar Region NDTI Distribution Analysis\n{start_date} to {end_date}', 
+                     fontsize=18, fontweight='bold')
+        
+        # Plot individual quadrant histograms (top 2 rows)
         quadrant_positions = {
             'Northwest': (0, 0),
             'Northeast': (0, 1),
-            'Southwest': (1, 0),
-            'Southeast': (1, 1)
+            'Southwest': (0, 2),
+            'Southeast': (0, 3)
         }
         
-        colors = ['#2E8B57', '#FF6347', '#4169E1', '#FFD700']
+        # Define bin edges for labeling (10 bins from -1.0 to 1.0)
+        bin_edges = np.arange(-1.0, 1.2, 0.2)
+        bin_labels = [f'{bin_edges[i]:.1f}-{bin_edges[i+1]:.1f}' for i in range(len(bin_edges)-1)]
         
         for quad_name, pos in quadrant_positions.items():
-            ax = axes[pos[0], pos[1]]
+            ax = fig.add_subplot(gs[pos[0], pos[1]])
             result = quadrant_results.get(quad_name)
             
-            if result:
-                stats = ['Mean', 'Min', 'Max', 'Std Dev']
-                values = [
-                    result['mean_ndti'],
-                    result['min_ndti'],
-                    result['max_ndti'],
-                    result['std_ndti']
-                ]
+            if result and 'histogram' in result and result['histogram']:
+                bins, counts = parse_histogram(result['histogram'])
                 
-                bars = ax.bar(stats, values, color=colors, alpha=0.7, edgecolor='black')
-                ax.set_ylabel('NDTI Value')
-                ax.set_title(f'{quad_name}\n(Images: {result["image_count"]})', fontweight='bold')
-                ax.axhline(y=0, color='gray', linestyle='--', linewidth=0.5)
-                ax.set_ylim(-1, 1)
-                ax.grid(True, alpha=0.3, axis='y')
-                
-                for bar, value in zip(bars, values):
-                    height = bar.get_height()
-                    ax.text(bar.get_x() + bar.get_width()/2., height,
-                           f'{value:.3f}',
-                           ha='center', va='bottom' if height > 0 else 'top',
-                           fontsize=8, fontweight='bold')
+                if bins and counts:
+                    # Create bar chart
+                    colors = plt.cm.viridis(np.linspace(0, 1, len(counts)))
+                    bars = ax.bar(range(len(counts)), counts, color=colors, alpha=0.8, edgecolor='black')
+                    
+                    ax.set_xlabel('NDTI Interval', fontweight='bold', fontsize=9)
+                    ax.set_ylabel('Pixel Count', fontweight='bold', fontsize=9)
+                    ax.set_title(f'{quad_name}\nMean: {result["mean_ndti"]:.4f} | n={result["image_count"]}', 
+                               fontweight='bold', fontsize=10)
+                    ax.set_xticks(range(len(counts)))
+                    ax.set_xticklabels(bin_labels, rotation=45, ha='right', fontsize=7)
+                    ax.grid(True, alpha=0.3, axis='y')
+                    
+                    # Add count labels on bars
+                    for bar, count in zip(bars, counts):
+                        height = bar.get_height()
+                        if height > 0:
+                            ax.text(bar.get_x() + bar.get_width()/2., height,
+                                   f'{int(count)}',
+                                   ha='center', va='bottom', fontsize=7)
+                else:
+                    ax.text(0.5, 0.5, f'{quad_name}\nNo histogram data', 
+                           ha='center', va='center', transform=ax.transAxes)
             else:
                 ax.text(0.5, 0.5, f'{quad_name}\nNo Data', 
                        ha='center', va='center', transform=ax.transAxes,
@@ -414,93 +481,158 @@ def visualize_bihar_results(quadrant_results, overall_mean, start_date, end_date
                 ax.set_xticks([])
                 ax.set_yticks([])
         
-        # Overall mean plot
-        ax_mean = axes[0, 2]
-        if overall_mean:
-            stats = ['Mean', 'Min', 'Max', 'Avg Std']
-            values = [
-                overall_mean['mean_ndti'],
-                overall_mean['min_ndti'],
-                overall_mean['max_ndti'],
-                overall_mean['std_ndti']
-            ]
-            
-            bars = ax_mean.bar(stats, values, color=colors, alpha=0.7, edgecolor='black')
-            ax_mean.set_ylabel('NDTI Value')
-            ax_mean.set_title('Bihar Overall Statistics', fontweight='bold', fontsize=12)
-            ax_mean.axhline(y=0, color='gray', linestyle='--', linewidth=0.5)
-            ax_mean.set_ylim(-1, 1)
-            ax_mean.grid(True, alpha=0.3, axis='y')
-            
-            for bar, value in zip(bars, values):
-                height = bar.get_height()
-                ax_mean.text(bar.get_x() + bar.get_width()/2., height,
-                           f'{value:.3f}',
-                           ha='center', va='bottom' if height > 0 else 'top',
-                           fontsize=9, fontweight='bold')
+        # Row 2: Quadrant statistics bars
+        stats_positions = {
+            'Northwest': (1, 0),
+            'Northeast': (1, 1),
+            'Southwest': (1, 2),
+            'Southeast': (1, 3)
+        }
         
-        # Summary text
-        ax_summary = axes[1, 2]
+        for quad_name, pos in stats_positions.items():
+            ax = fig.add_subplot(gs[pos[0], pos[1]])
+            result = quadrant_results.get(quad_name)
+            
+            if result:
+                stats = ['Mean', 'Min', 'Max']
+                values = [result['mean_ndti'], result['min_ndti'], result['max_ndti']]
+                colors_stat = ['#2E8B57', '#FF6347', '#4169E1']
+                
+                bars = ax.bar(stats, values, color=colors_stat, alpha=0.7, edgecolor='black')
+                ax.set_ylabel('NDTI Value', fontweight='bold', fontsize=9)
+                ax.set_title(f'{quad_name} Stats', fontweight='bold', fontsize=10)
+                ax.axhline(y=0, color='gray', linestyle='--', linewidth=0.5)
+                ax.set_ylim(-0.2, 0.5)
+                ax.grid(True, alpha=0.3, axis='y')
+                
+                for bar, value in zip(bars, values):
+                    height = bar.get_height()
+                    ax.text(bar.get_x() + bar.get_width()/2., height,
+                           f'{value:.4f}',
+                           ha='center', va='bottom' if height > 0 else 'top',
+                           fontsize=8, fontweight='bold')
+            else:
+                ax.text(0.5, 0.5, 'No Data', ha='center', va='center', 
+                       transform=ax.transAxes)
+                ax.set_xticks([])
+                ax.set_yticks([])
+        
+        # Row 3: Overall Bihar histogram (spans 3 columns)
+        ax_overall_hist = fig.add_subplot(gs[2, :3])
+        
+        # Combine all quadrant histograms
+        all_bins = None
+        all_counts = np.zeros(10)  # 10 bins
+        quadrants_with_data = 0
+        
+        for quad_name in ['Northwest', 'Northeast', 'Southwest', 'Southeast']:
+            result = quadrant_results.get(quad_name)
+            if result and 'histogram' in result and result['histogram']:
+                bins, counts = parse_histogram(result['histogram'])
+                if bins and counts:
+                    all_counts += np.array(counts[:10])  # Ensure we only take 10 bins
+                    quadrants_with_data += 1
+        
+        if quadrants_with_data > 0:
+            colors = plt.cm.plasma(np.linspace(0, 1, len(all_counts)))
+            bars = ax_overall_hist.bar(range(len(all_counts)), all_counts, 
+                                       color=colors, alpha=0.8, edgecolor='black', linewidth=1.5)
+            
+            ax_overall_hist.set_xlabel('NDTI Interval', fontweight='bold', fontsize=11)
+            ax_overall_hist.set_ylabel('Total Pixel Count (All Quadrants)', fontweight='bold', fontsize=11)
+            ax_overall_hist.set_title('Bihar Overall NDTI Distribution', fontweight='bold', fontsize=13)
+            ax_overall_hist.set_xticks(range(len(all_counts)))
+            ax_overall_hist.set_xticklabels(bin_labels, rotation=45, ha='right', fontsize=9)
+            ax_overall_hist.grid(True, alpha=0.3, axis='y')
+            
+            # Add count labels
+            for bar, count in zip(bars, all_counts):
+                height = bar.get_height()
+                if height > 0:
+                    ax_overall_hist.text(bar.get_x() + bar.get_width()/2., height,
+                                        f'{int(count)}',
+                                        ha='center', va='bottom', fontsize=9, fontweight='bold')
+            
+            # Add mean line
+            if overall_mean:
+                mean_val = overall_mean['mean_ndti']
+                # Convert mean to bin position
+                bin_pos = (mean_val + 1.0) / 0.2  # Map -1 to 1 range to 0-10 bins
+                ax_overall_hist.axvline(x=bin_pos, color='red', linestyle='--', 
+                                       linewidth=3, label=f"Mean: {mean_val:.4f}", alpha=0.8)
+                ax_overall_hist.legend(fontsize=10, loc='upper right')
+        else:
+            ax_overall_hist.text(0.5, 0.5, 'No histogram data available', 
+                                ha='center', va='center', transform=ax_overall_hist.transAxes,
+                                fontsize=12)
+        
+        # Row 3: Summary statistics (rightmost column)
+        ax_summary = fig.add_subplot(gs[2, 3])
         ax_summary.axis('off')
         
         if overall_mean:
             summary_text = f"""
-Bihar NDTI Summary
-{'='*35}
+BIHAR OVERALL STATISTICS
+{'='*28}
 
-Period: {start_date} to {end_date}
+Mean:  {overall_mean['mean_ndti']:.6f}
+Min:   {overall_mean['min_ndti']:.6f}
+Max:   {overall_mean['max_ndti']:.6f}
+Std:   {overall_mean['std_ndti']:.6f}
 
-Overall Statistics:
-• Mean NDTI: {overall_mean['mean_ndti']:.4f}
-• Min NDTI:  {overall_mean['min_ndti']:.4f}
-• Max NDTI:  {overall_mean['max_ndti']:.4f}
-• Avg Std:   {overall_mean['std_ndti']:.4f}
+Ground Truth:
+Mean:  0.142487
+Min:   0.064551
+Max:   0.292054
 
-Data Coverage:
-• Quadrants: {overall_mean['quadrants_analyzed']}/4
-• Total Images: {overall_mean['total_images']}
+Difference:
+ΔMean: {abs(overall_mean['mean_ndti'] - 0.142487):.6f}
+ΔMin:  {abs(overall_mean['min_ndti'] - 0.064551):.6f}
+ΔMax:  {abs(overall_mean['max_ndti'] - 0.292054):.6f}
 
-Individual Quadrant Means:
-"""
-            for quad_name in ['Northwest', 'Northeast', 'Southwest', 'Southeast']:
-                result = quadrant_results.get(quad_name)
-                if result:
-                    summary_text += f"• {quad_name}: {result['mean_ndti']:.4f}\n"
-                else:
-                    summary_text += f"• {quad_name}: No Data\n"
-            
-            summary_text += """
-NDTI Interpretation:
-Higher → Bare soil/tilled
-Lower → Vegetation/residue
+Data:
+Quadrants: {overall_mean['quadrants_analyzed']}/4
+Images: {overall_mean['total_images']}
 
-Formula: (B11-B12)/(B11+B12)
+Histogram Bins:
+10 intervals of 0.2 width
+Range: -1.0 to +1.0
             """
             
             ax_summary.text(0.05, 0.5, summary_text, transform=ax_summary.transAxes,
-                          fontsize=10, verticalalignment='center',
+                          fontsize=9, verticalalignment='center',
                           fontfamily='monospace',
-                          bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.3))
+                          bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.3))
         
         plt.tight_layout()
         plt.show()
         
     except Exception as e:
         print(f"Error creating visualization: {e}")
+        import traceback
+        traceback.print_exc()
 
 def main_bihar_analysis():
     """Main processing pipeline for Bihar region split into 4 quadrants"""
     
-    # Set time period
-    start_date = '2017-11-01'
-    end_date = '2018-03-02'
+    # Set time period - Extended to capture more images
+    start_date = '2017-10-15'  # Start earlier (mid-October)
+    end_date = '2018-03-15'    # End later (mid-March)
     
-    print("🌾 Bihar Region NDTI Analysis")
+    print("🌾 Bihar Region NDTI Analysis (EXTENDED)")
     print("=" * 60)
-    print(f"📍 Region: Bihar, India (4 Quadrants)")
-    print(f"📅 Period: {start_date} to {end_date} (Dry Season)")
+    print(f"📍 Region: Bihar, India (4 Quadrants - Extended Coverage)")
+    print(f"📅 Period: {start_date} to {end_date} (Extended Dry Season)")
     print(f"📊 NDTI Formula: (B11-B12)/(B11+B12)")
     print(f"📊 NDTI Range: -1 to +1")
+    print()
+    print("🔧 Optimizations for More Images:")
+    print("   • Extended time period (Oct 15 - Mar 15)")
+    print("   • Relaxed cloud threshold (60% vs 70%)")
+    print("   • Relaxed clear sky threshold (0.60 vs 0.70)")
+    print("   • Lower pixel count requirement (10 vs 50)")
+    print("   • Less restrictive masking (allows medium clouds)")
+    print("   • Extended geographic boundaries")
     print()
     
     try:
@@ -542,12 +674,20 @@ def main_bihar_analysis():
         if overall_mean:
             print("\n✅ BIHAR OVERALL RESULTS:")
             print("="*60)
-            print(f"Mean NDTI across Bihar: {overall_mean['mean_ndti']:.4f}")
-            print(f"Min NDTI: {overall_mean['min_ndti']:.4f}")
-            print(f"Max NDTI: {overall_mean['max_ndti']:.4f}")
-            print(f"Average Std Dev: {overall_mean['std_ndti']:.4f}")
+            print(f"Mean NDTI across Bihar: {overall_mean['mean_ndti']:.6f}")
+            print(f"Mean Min NDTI: {overall_mean['min_ndti']:.6f}")
+            print(f"Mean Max NDTI: {overall_mean['max_ndti']:.6f}")
+            print(f"Average Std Dev: {overall_mean['std_ndti']:.6f}")
             print(f"Total Images Used: {overall_mean['total_images']}")
             print(f"Quadrants Successfully Analyzed: {overall_mean['quadrants_analyzed']}/4")
+            print()
+            
+            print("📊 COMPARISON WITH GROUND TRUTH:")
+            print("="*60)
+            print(f"                  Our Results    Ground Truth    Difference")
+            print(f"Mean NDTI:        {overall_mean['mean_ndti']:.6f}       0.142487        {abs(overall_mean['mean_ndti'] - 0.142487):.6f}")
+            print(f"Mean Min:         {overall_mean['min_ndti']:.6f}       0.064551        {abs(overall_mean['min_ndti'] - 0.064551):.6f}")
+            print(f"Mean Max:         {overall_mean['max_ndti']:.6f}       0.292054        {abs(overall_mean['max_ndti'] - 0.292054):.6f}")
             print()
             
             # Print individual quadrant means
@@ -555,7 +695,7 @@ def main_bihar_analysis():
             for quad_name in ['Northwest', 'Northeast', 'Southwest', 'Southeast']:
                 result = quadrant_results.get(quad_name)
                 if result:
-                    print(f"  {quad_name:12s}: {result['mean_ndti']:.4f} (n={result['image_count']})")
+                    print(f"  {quad_name:12s}: {result['mean_ndti']:.6f} (n={result['image_count']})")
                 else:
                     print(f"  {quad_name:12s}: No Data")
             
@@ -576,9 +716,10 @@ def main_bihar_analysis():
 
 if __name__ == "__main__":
     try:
-        print("🚀 Starting Bihar Cropland NDTI Analysis")
+        print("🚀 Starting Bihar Cropland NDTI Analysis (EXTENDED)")
         print("📍 Region: Bihar, India (4 Quadrants)")
-        print("📅 Period: November 2017 - March 2018 (Dry Season)")
+        print("📅 Period: October 2017 - March 2018 (Extended Dry Season)")
+        print("🔧 Mode: Maximum Image Capture (Relaxed Filters)")
         print()
         
         result = main_bihar_analysis()
